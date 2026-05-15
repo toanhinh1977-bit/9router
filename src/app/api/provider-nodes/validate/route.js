@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { isIP } from "net";
 
 // Fetch with timeout wrapper
 const fetchWithTimeout = (url, options, timeout = 10000) => {
@@ -49,6 +50,85 @@ const getChatErrorMessage = (status) => {
   return `Chat request failed (${status})`;
 };
 
+// --- SSRF Protection ---
+
+// Convert IPv4 string to numeric for range comparison
+const ipToNum = (ip) => {
+  const parts = ip.split(".").map(Number);
+  return ((parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]) >>> 0;
+};
+
+// Private/reserved CIDR blocks
+const PRIVATE_BLOCKS = [
+  { start: ipToNum("10.0.0.0"), end: ipToNum("10.255.255.255") },
+  { start: ipToNum("172.16.0.0"), end: ipToNum("172.31.255.255") },
+  { start: ipToNum("192.168.0.0"), end: ipToNum("192.168.255.255") },
+  { start: ipToNum("127.0.0.0"), end: ipToNum("127.255.255.255") },
+  { start: ipToNum("169.254.0.0"), end: ipToNum("169.254.255.255") },
+  { start: ipToNum("100.64.0.0"), end: ipToNum("100.127.255.255") },
+  { start: ipToNum("0.0.0.0"), end: ipToNum("0.255.255.255") },
+  { start: ipToNum("198.18.0.0"), end: ipToNum("198.19.255.255") },
+];
+
+const isPrivateIPv4 = (ip) => {
+  if (isIP(ip) !== 4) return false;
+  const num = ipToNum(ip);
+  return PRIVATE_BLOCKS.some(b => num >= b.start && num <= b.end);
+};
+
+const isPrivateIPv6 = (ip) => {
+  if (isIP(ip) !== 6) return false;
+  const lower = ip.toLowerCase();
+  // ::1 (loopback), fc00::/7 (unique local), fe80::/10 (link-local)
+  if (lower === "::1") return true;
+  if (lower.startsWith("fc") || lower.startsWith("fd")) return true;
+  if (lower.startsWith("fe80") || lower.startsWith("fe81") || lower.startsWith("fe82") || lower.startsWith("fe83")) return true;
+  if (lower.startsWith("fe84") || lower.startsWith("fe85") || lower.startsWith("fe86") || lower.startsWith("fe87")) return true;
+  if (lower.startsWith("fe88") || lower.startsWith("fe89") || lower.startsWith("fe8a") || lower.startsWith("fe8b")) return true;
+  if (lower.startsWith("fe8c") || lower.startsWith("fe8d") || lower.startsWith("fe8e") || lower.startsWith("fe8f")) return true;
+  if (lower.startsWith("fe9") || lower.startsWith("fea") || lower.startsWith("feb")) return true;
+  return false;
+};
+
+const isPrivateHost = (hostname) => {
+  // IP literal check
+  const ipVersion = isIP(hostname);
+  if (ipVersion === 4) return isPrivateIPv4(hostname);
+  if (ipVersion === 6) return isPrivateIPv6(hostname);
+
+  // hostname — resolve DNS
+  const lower = hostname.toLowerCase();
+  // Private-use TLDs / well-known internal domains
+  if (lower.endsWith(".local") || lower.endsWith(".internal") || 
+      lower.endsWith(".lan") || lower.endsWith(".home.arpa") ||
+      lower === "localhost") return true;
+
+  return false; // allow DNS resolution to proceed; fetch will resolve
+};
+
+// Validate URL against SSRF — returns error string or null (ok)
+const validateUrlForSSRF = (urlStr) => {
+  let parsed;
+  try {
+    parsed = new URL(urlStr);
+  } catch {
+    return "Invalid URL format";
+  }
+
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    return "Only http/https URLs are allowed";
+  }
+
+  const hostname = parsed.hostname;
+  if (isPrivateHost(hostname)) {
+    return "URL points to a private/internal network address";
+  }
+
+  return null; // pass
+};
+
+// --- End SSRF Protection ---
+
 // POST /api/provider-nodes/validate - Validate API key against base URL
 export async function POST(request) {
   try {
@@ -62,6 +142,12 @@ export async function POST(request) {
     // Validate URL format
     if (!isValidUrl(baseUrl)) {
       return NextResponse.json({ error: "Invalid URL format" }, { status: 400 });
+    }
+
+    // SSRF check — block private/internal network targets
+    const ssrfError = validateUrlForSSRF(baseUrl);
+    if (ssrfError) {
+      return NextResponse.json({ error: ssrfError }, { status: 400 });
     }
 
     // Custom Embedding Validation - test POST /embeddings directly

@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { validateApiKey, getProviderConnections, getModelAliases } from "@/models";
 
-// Verify API key and return provider credentials
+// Verify API key and return provider configurations (without credentials)
 export async function POST(request) {
   try {
     const authHeader = request.headers.get("Authorization");
@@ -20,13 +20,12 @@ export async function POST(request) {
     // Get active provider connections
     const connections = await getProviderConnections({ isActive: true });
 
-    // Map connections
+    // Map connections — strip credentials (apiKey, accessToken, refreshToken)
+    // to avoid leaking provider secrets to API-key authenticated clients.
+    // The proxy injects credentials server-side; clients never need them directly.
     const mappedConnections = connections.map(conn => ({
       provider: conn.provider,
       authType: conn.authType,
-      apiKey: conn.apiKey || null,
-      accessToken: conn.accessToken || null,
-      refreshToken: conn.refreshToken || null,
       projectId: conn.projectId || null,
       expiresAt: conn.expiresAt,
       priority: conn.priority,
